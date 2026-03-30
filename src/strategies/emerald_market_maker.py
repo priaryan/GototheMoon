@@ -3,11 +3,14 @@ from dataclasses import dataclass
 from typing import List, Dict
 
 try:
-    # When running via backtester
+    # When running via backtester (PREFERRED)
     from prosperity3bt.datamodel import Order, OrderDepth
 except ImportError:
-    # When running locally
-    from datamodel import Order, OrderDepth
+    try:
+        # Fallback to local datamodel
+        from datamodel import Order, OrderDepth
+    except ImportError:
+        raise ImportError("Could not import Order/OrderDepth from prosperity3bt or local datamodel")
 
 
 @dataclass

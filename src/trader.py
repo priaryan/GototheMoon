@@ -1,11 +1,10 @@
 """
 Main trader class compatible with IMC Prosperity 3 backtester.
 
-This trader uses the EmeraldMarketMaker strategy for EMERALDS.
+This trader uses the market maker strategy for products in the data.
 """
 
-import json
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 try:
     # When running via backtester
@@ -14,7 +13,7 @@ except ImportError:
     # When running locally
     from datamodel import Order, TradingState, OrderDepth, Symbol
 
-from strategies.emerald_market_maker import EmeraldMarketMaker, EmeraldConfig
+from strategies.market_maker import MarketMaker, MarketMakerConfig
 
 
 class Trader:
@@ -24,17 +23,28 @@ class Trader:
     """
 
     def __init__(self):
-        """Initialize all strategies."""
-        # Initialize emerald market maker
-        self.emerald_config = EmeraldConfig(
+        """Initialize strategies for all available products."""
+        # Market maker for EMERALDS
+        self.emeralds_config = MarketMakerConfig(
             symbol="EMERALDS",
             fair_value=10000,
-            position_limit=20,
-            soft_inventory_limit=12,
-            base_quote_size=6,
+            position_limit=10,
+            soft_inventory_limit=5,
+            base_quote_size=3,
             inventory_step=5,
         )
-        self.emerald_mm = EmeraldMarketMaker(self.emerald_config)
+        self.emeralds_mm = MarketMaker(self.emeralds_config)
+
+        # Market maker for TOMATOES
+        self.tomatoes_config = MarketMakerConfig(
+            symbol="TOMATOES",
+            fair_value=5000,
+            position_limit=10,
+            soft_inventory_limit=5,
+            base_quote_size=3,
+            inventory_step=5,
+        )
+        self.tomatoes_mm = MarketMaker(self.tomatoes_config)
 
     def run(self, state: TradingState) -> Tuple[Dict[Symbol, List[Order]], List, str]:
         """
@@ -51,18 +61,21 @@ class Trader:
         orders: Dict[Symbol, List[Order]] = {}
         conversions: List = []
         
-        # Get current position for EMERALDS
-        emerald_position = state.position.get("EMERALDS", 0)
+        # Trade EMERALDS
+        if "EMERALDS" in state.order_depths:
+            emeralds_position = state.position.get("EMERALDS", 0)
+            emeralds_order_depth = state.order_depths["EMERALDS"]
+            emeralds_orders = self.emeralds_mm.generate_orders(emeralds_order_depth, emeralds_position)
+            if emeralds_orders:
+                orders["EMERALDS"] = emeralds_orders
         
-        # Get order depth for EMERALDS
-        emerald_order_depth = state.order_depths.get("EMERALDS", OrderDepth())
-        
-        # Generate orders using emerald market maker
-        emerald_orders = self.emerald_mm.generate_orders(emerald_order_depth, emerald_position)
-        
-        # Group orders by symbol (they should all be EMERALDS)
-        if emerald_orders:
-            orders["EMERALDS"] = emerald_orders
+        # Trade TOMATOES
+        if "TOMATOES" in state.order_depths:
+            tomatoes_position = state.position.get("TOMATOES", 0)
+            tomatoes_order_depth = state.order_depths["TOMATOES"]
+            tomatoes_orders = self.tomatoes_mm.generate_orders(tomatoes_order_depth, tomatoes_position)
+            if tomatoes_orders:
+                orders["TOMATOES"] = tomatoes_orders
         
         # Return orders, conversions, and trader data
         trader_data = ""  # No persistent state needed for now
