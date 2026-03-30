@@ -41,3 +41,6 @@ wheels/
 # Environment variables
 .env
 .env.local
+
+# External repositories
+backtests/imc-prosperity-3-backtester/
