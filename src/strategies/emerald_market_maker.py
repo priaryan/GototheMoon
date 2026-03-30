@@ -2,7 +2,12 @@
 from dataclasses import dataclass
 from typing import List, Dict
 
-from datamodel import Order, OrderDepth
+try:
+    # When running via backtester
+    from prosperity3bt.datamodel import Order, OrderDepth
+except ImportError:
+    # When running locally
+    from datamodel import Order, OrderDepth
 
 
 @dataclass
