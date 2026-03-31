@@ -1,0 +1,23 @@
+{
+  "backtest_id": "backtest-3c3dee51",
+  "days": [
+    {
+      "day": "-1",
+      "ticks": 10000,
+      "own_trades": 0,
+      "final_pnl": 0.0,
+      "pnl_by_product": {
+        "EMERALDS": 0.0
+      }
+    },
+    {
+      "day": "-2",
+      "ticks": 10000,
+      "own_trades": 0,
+      "final_pnl": 0.0,
+      "pnl_by_product": {
+        "EMERALDS": 0.0
+      }
+    }
+  ]
+}
