@@ -1,109 +1,219 @@
 from datamodel import Order, OrderDepth, TradingState
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
+import json
 
 
 @dataclass
-class EmeraldConfig:
-    symbol: str = "EMERALDS"
-    fair_value: int = 10000
+class ProductConfig:
+    symbol: str
     position_limit: int = 20
-    soft_inventory_limit: int = 12
-    base_quote_size: int = 6
-    inventory_step: int = 5
+
+    # Fair value
+    use_volume_wall: bool = True
+    top_mid_weight: float = 0.35
+    wall_mid_weight: float = 0.65
+
+    # Taking
+    take_edge: float = 1.0
+
+    # Passive quoting
+    base_quote_edge: int = 1
+    passive_order_size: int = 6
+
+    # Inventory control
+    skew_per_unit: float = 0.08
+    flatten_at_fair: bool = True
 
 
-class EmeraldMarketMaker:
+PRODUCT_CONFIGS: Dict[str, ProductConfig] = {
+    "EMERALDS": ProductConfig(
+        symbol="EMERALDS",
+        position_limit=20,
+        use_volume_wall=True,
+        top_mid_weight=0.30,
+        wall_mid_weight=0.70,
+        take_edge=1.0,
+        base_quote_edge=1,
+        passive_order_size=6,
+        skew_per_unit=0.10,
+        flatten_at_fair=True,
+    ),
+    "TOMATOES": ProductConfig(
+        symbol="TOMATOES",
+        position_limit=20,
+        use_volume_wall=True,
+        top_mid_weight=0.3,
+        wall_mid_weight=0.7,
+        take_edge=1.0,
+        base_quote_edge=1,
+        passive_order_size=5,
+        skew_per_unit=0.07,
+        flatten_at_fair=True,
+    ),
+}
+
+
+class StaticMarketMaker:
     """
-    EMERALDS market maker strategy.
+    Refined static style market maker.
 
-    Logic per timestep:
-    1. Buy asks below fair
-    2. Sell bids above fair
-    3. Flatten stretched inventory at fair
-    4. Quote passively inside the spread
-    5. Skew quotes based on inventory
+    Main ideas
+    1. Estimate fair from top mid and size wall mid
+    2. Take clear mispricings through fair
+    3. Flatten inventory at fair when possible
+    4. Quote passively around inventory adjusted fair
+    5. Cap passive size to reduce noisy inventory swings
     """
 
-    def __init__(self, config: EmeraldConfig | None = None):
-        self.config = config or EmeraldConfig()
+    def __init__(self, config: ProductConfig):
+        self.config = config
 
-    def generate_orders(self, order_depth: OrderDepth, position: int) -> List[Order]:
+    def _load_trader_data(self, trader_data: str) -> Dict:
+        if not trader_data:
+            return {}
+        try:
+            return json.loads(trader_data)
+        except Exception:
+            return {}
+
+    def _get_top_mid(
+        self,
+        buy_orders: Dict[int, int],
+        sell_orders: Dict[int, int],
+    ) -> float:
+        best_bid = max(buy_orders)
+        best_ask = min(sell_orders)
+        return (best_bid + best_ask) / 2.0
+
+    def _get_wall_mid(
+        self,
+        buy_orders: Dict[int, int],
+        sell_orders: Dict[int, int],
+    ) -> float:
+        bid_wall = max(buy_orders.items(), key=lambda x: (x[1], x[0]))[0]
+        ask_wall = min(sell_orders.items(), key=lambda x: (-x[1], x[0]))[0]
+        return (bid_wall + ask_wall) / 2.0
+
+    def _get_fair_value(
+        self,
+        buy_orders: Dict[int, int],
+        sell_orders: Dict[int, int],
+    ) -> float:
+        top_mid = self._get_top_mid(buy_orders, sell_orders)
+
+        if not self.config.use_volume_wall:
+            return top_mid
+
+        wall_mid = self._get_wall_mid(buy_orders, sell_orders)
+        fair = (
+            self.config.top_mid_weight * top_mid
+            + self.config.wall_mid_weight * wall_mid
+        )
+        return fair
+
+    def _get_passive_prices(
+        self,
+        buy_orders: Dict[int, int],
+        sell_orders: Dict[int, int],
+        adjusted_fair: float,
+    ) -> Tuple[int, int]:
+        best_bid = max(buy_orders)
+        best_ask = min(sell_orders)
+
+        bid_price = int(adjusted_fair - self.config.base_quote_edge)
+        ask_price = int(adjusted_fair + self.config.base_quote_edge)
+
+        bid_price = min(bid_price, best_ask - 1)
+        ask_price = max(ask_price, best_bid + 1)
+
+        if bid_price >= ask_price:
+            bid_price = best_bid
+            ask_price = best_ask
+
+        return bid_price, ask_price
+
+    def generate_orders(
+        self,
+        order_depth: OrderDepth,
+        position: int,
+    ) -> List[Order]:
+        raw_buys: Dict[int, int] = order_depth.buy_orders or {}
+        raw_sells: Dict[int, int] = order_depth.sell_orders or {}
+
+        if not raw_buys or not raw_sells:
+            return []
+
+        buy_orders = {p: abs(v) for p, v in sorted(raw_buys.items(), reverse=True)}
+        sell_orders = {p: abs(v) for p, v in sorted(raw_sells.items())}
+
+        fair = self._get_fair_value(buy_orders, sell_orders)
+
+        inventory_skew = position * self.config.skew_per_unit
+        adjusted_fair = fair - inventory_skew
+
         orders: List[Order] = []
-        cfg = self.config
-        fair = cfg.fair_value
-        current_pos = position
 
-        buy_orders: Dict[int, int] = order_depth.buy_orders or {}
-        sell_orders: Dict[int, int] = order_depth.sell_orders or {}
+        max_buy = self.config.position_limit - position
+        max_sell = self.config.position_limit + position
 
-        # 1. Take favorable asks
-        for ask_price in sorted(sell_orders.keys()):
-            if ask_price >= fair:
+        # 1. Take asks that are clearly cheap
+        for ask_price, ask_volume in sell_orders.items():
+            if max_buy <= 0:
                 break
 
-            ask_vol = -sell_orders[ask_price]
-            buy_capacity = cfg.position_limit - current_pos
-            trade_size = min(ask_vol, buy_capacity)
+            if ask_price < adjusted_fair - self.config.take_edge:
+                size = min(ask_volume, max_buy)
+                if size > 0:
+                    orders.append(Order(self.config.symbol, ask_price, size))
+                    max_buy -= size
 
-            if trade_size > 0:
-                orders.append(Order(cfg.symbol, ask_price, trade_size))
-                current_pos += trade_size
+            elif (
+                self.config.flatten_at_fair
+                and position < 0
+                and ask_price <= fair
+            ):
+                size = min(ask_volume, abs(position), max_buy)
+                if size > 0:
+                    orders.append(Order(self.config.symbol, ask_price, size))
+                    max_buy -= size
 
-        # 2. Take favorable bids
-        for bid_price in sorted(buy_orders.keys(), reverse=True):
-            if bid_price <= fair:
+        # 2. Take bids that are clearly rich
+        for bid_price, bid_volume in buy_orders.items():
+            if max_sell <= 0:
                 break
 
-            bid_vol = buy_orders[bid_price]
-            sell_capacity = cfg.position_limit + current_pos
-            trade_size = min(bid_vol, sell_capacity)
+            if bid_price > adjusted_fair + self.config.take_edge:
+                size = min(bid_volume, max_sell)
+                if size > 0:
+                    orders.append(Order(self.config.symbol, bid_price, -size))
+                    max_sell -= size
 
-            if trade_size > 0:
-                orders.append(Order(cfg.symbol, bid_price, -trade_size))
-                current_pos -= trade_size
+            elif (
+                self.config.flatten_at_fair
+                and position > 0
+                and bid_price >= fair
+            ):
+                size = min(bid_volume, position, max_sell)
+                if size > 0:
+                    orders.append(Order(self.config.symbol, bid_price, -size))
+                    max_sell -= size
 
-        # 3. Flatten inventory at fair if stretched
-        if current_pos > cfg.soft_inventory_limit and fair in buy_orders:
-            trade_size = min(buy_orders[fair], current_pos - cfg.soft_inventory_limit)
-            if trade_size > 0:
-                orders.append(Order(cfg.symbol, fair, -trade_size))
-                current_pos -= trade_size
+        # 3. Passive quoting with capped size
+        bid_price, ask_price = self._get_passive_prices(
+            buy_orders,
+            sell_orders,
+            adjusted_fair,
+        )
 
-        if current_pos < -cfg.soft_inventory_limit and fair in sell_orders:
-            trade_size = min(-sell_orders[fair], -cfg.soft_inventory_limit - current_pos)
-            if trade_size > 0:
-                orders.append(Order(cfg.symbol, fair, trade_size))
-                current_pos += trade_size
+        passive_buy_size = min(self.config.passive_order_size, max_buy)
+        passive_sell_size = min(self.config.passive_order_size, max_sell)
 
-        # 4. Passive quoting inside spread
-        best_bid = max(buy_orders.keys()) if buy_orders else fair - 1
-        best_ask = min(sell_orders.keys()) if sell_orders else fair + 1
+        if passive_buy_size > 0:
+            orders.append(Order(self.config.symbol, bid_price, passive_buy_size))
 
-        bid_quote = min(best_bid + 1, fair - 1)
-        ask_quote = max(best_ask - 1, fair + 1)
-
-        # 5. Inventory skew
-        skew_steps = current_pos // cfg.inventory_step
-        bid_quote -= skew_steps
-        ask_quote -= skew_steps
-
-        # Safety fallback
-        if bid_quote >= ask_quote:
-            bid_quote = fair - 1
-            ask_quote = fair + 1
-
-        max_buy = cfg.position_limit - current_pos
-        max_sell = cfg.position_limit + current_pos
-
-        bid_size = min(cfg.base_quote_size, max(0, max_buy))
-        ask_size = min(cfg.base_quote_size, max(0, max_sell))
-
-        if bid_size > 0:
-            orders.append(Order(cfg.symbol, bid_quote, bid_size))
-
-        if ask_size > 0:
-            orders.append(Order(cfg.symbol, ask_quote, -ask_size))
+        if passive_sell_size > 0:
+            orders.append(Order(self.config.symbol, ask_price, -passive_sell_size))
 
         return orders
 
@@ -111,37 +221,33 @@ class EmeraldMarketMaker:
 class Trader:
     """
     IMC submission entry point.
-    Trades EMERALDS only.
+    Trades EMERALDS and TOMATOES with a refined static style market maker.
     """
 
+    SYMBOLS = ["EMERALDS", "TOMATOES"]
+
     def __init__(self):
-        self.emeralds_mm = EmeraldMarketMaker(
-            EmeraldConfig(
-                symbol="EMERALDS",
-                fair_value=10000,
-                position_limit=20,
-                soft_inventory_limit=12,
-                base_quote_size=6,
-                inventory_step=5,
-            )
-        )
+        self.makers = {
+            symbol: StaticMarketMaker(PRODUCT_CONFIGS[symbol])
+            for symbol in self.SYMBOLS
+        }
 
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
-        orders: Dict[str, List[Order]] = {}
+        result: Dict[str, List[Order]] = {}
 
-        if "EMERALDS" in state.order_depths:
-            emeralds_position = state.position.get("EMERALDS", 0)
-            emeralds_order_depth = state.order_depths["EMERALDS"]
+        for symbol in self.SYMBOLS:
+            if symbol not in state.order_depths:
+                continue
 
-            emeralds_orders = self.emeralds_mm.generate_orders(
-                emeralds_order_depth,
-                emeralds_position,
-            )
+            maker = self.makers[symbol]
+            position = state.position.get(symbol, 0)
+            order_depth = state.order_depths[symbol]
 
-            if emeralds_orders:
-                orders["EMERALDS"] = emeralds_orders
+            orders = maker.generate_orders(order_depth, position)
+            if orders:
+                result[symbol] = orders
 
         conversions = 0
         trader_data = ""
 
-        return orders, conversions, trader_data
+        return result, conversions, trader_data
