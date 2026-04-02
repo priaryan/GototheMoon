@@ -337,10 +337,47 @@ class LogVisualizer:
         snaps = self.snapshots[product]
         trades_for_product = [t for t in self.trades if t.product == product]
         
-        # Extract data
-        timestamps = list(range(len(snaps)))
+        # Extract data and create timestamp mapping
+        snapshots_ts = [int(s.timestamp) for s in snaps]
         positions = [s.position for s in snaps]
         pnls = [s.pnl for s in snaps]
+
+        # Compute spread (ask - bid) per snapshot and normalize for plotting
+        spreads = []
+        for s in snaps:
+            try:
+                if s.ask_wall is not None and s.bid_wall is not None:
+                    spreads.append(max(0, s.ask_wall - s.bid_wall))
+                else:
+                    spreads.append(0)
+            except Exception:
+                spreads.append(0)
+
+        max_spread = max(spreads) if spreads else 1
+        if max_spread == 0:
+            max_spread = 1
+        norm_spread = [(float(x) / max_spread) * 0.4 for x in spreads]
+        
+        # Create timestamp->index mapping for trades
+        ts_to_idx = {ts: i for i, ts in enumerate(snapshots_ts)}
+        
+        # Map each trade to its snapshot index
+        trade_indices = []
+        for t in trades_for_product:
+            try:
+                trade_ts = int(t.timestamp)
+                # Find closest snapshot to this trade
+                if trade_ts in ts_to_idx:
+                    idx = ts_to_idx[trade_ts]
+                else:
+                    # Find nearest timestamp
+                    idx = min(range(len(snapshots_ts)), key=lambda i: abs(snapshots_ts[i] - trade_ts))
+                trade_indices.append(idx)
+            except (ValueError, TypeError):
+                trade_indices.append(0)
+        
+        # Use snapshot indices for x-axis
+        timestamps = list(range(len(snaps)))
         
         # Create figure with subplots
         fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(16, 10), sharex=True)
@@ -352,12 +389,20 @@ class LogVisualizer:
         ax1.set_ylabel('Position', fontweight='bold')
         ax1.grid(True, alpha=0.3)
         
-        # Overlay trades with MUCH LARGER markers
+        # Draw a faint spread band behind trades so spread is visible
+        try:
+            ax1.fill_between(timestamps, [-v for v in norm_spread], norm_spread, color='gray', alpha=0.12)
+            ax1.plot(timestamps, norm_spread, color='gray', linewidth=0.6, alpha=0.5)
+        except Exception:
+            pass
+
+        # Overlay trades with MUCH LARGER markers at correct positions
         for idx, trade in enumerate(trades_for_product):
+            trade_snapshot_idx = trade_indices[idx]
             color = 'green' if trade.action.upper() == 'BUY' else 'red'
             marker = '^' if trade.action.upper() == 'BUY' else 'v'
             size = 200  # Much larger!
-            ax1.scatter([idx], [0.8 if trade.action.upper() == 'BUY' else -0.8], 
+            ax1.scatter([trade_snapshot_idx], [0.8 if trade.action.upper() == 'BUY' else -0.8], 
                        color=color, marker=marker, s=size, zorder=5, 
                        edgecolors='black', linewidth=1.5,
                        label=f'{trade.action} ({trade.quantity} @ {trade.price})')
@@ -375,18 +420,18 @@ class LogVisualizer:
         ax2.grid(True, alpha=0.3)
         ax2.legend()
         
-        # Plot 3: Trade details - show every trade with price and volume
+        # Plot 3: Trade details - show every trade with price and volume at correct timeline positions
         if trades_for_product:
-            trade_indices = np.arange(len(trades_for_product))
             trade_volumes = [t.quantity for t in trades_for_product]
             trade_prices = [t.price for t in trades_for_product]
             colors = ['green' if t.action.upper() == 'BUY' else 'red' for t in trades_for_product]
             
-            # Bar chart for volume
-            bars = ax3.bar(trade_indices, trade_volumes, color=colors, alpha=0.6, edgecolor='black', linewidth=0.5)
+            # Bar chart for volume using CORRECT timeline positions
+            bars = ax3.bar(trade_indices, trade_volumes, width=15, color=colors, alpha=0.6, edgecolor='black', linewidth=0.5)
             ax3.set_ylabel('Trade Volume', fontweight='bold')
-            ax3.set_xlabel('Trade #', fontweight='bold')
+            ax3.set_xlabel('Timeline Position', fontweight='bold')
             ax3.grid(True, alpha=0.3, axis='y')
+            ax3.set_xlim(0, len(timestamps))  # Match position and P&L axes
             
             # Add price labels on top of bars
             for i, (bar, price) in enumerate(zip(bars, trade_prices)):
@@ -404,7 +449,7 @@ class LogVisualizer:
             plt.show()
     
     def create_interactive_html(self, output_file: str = "trading_dashboard.html"):
-        """Create interactive HTML dashboard using Plotly with better trade visibility."""
+        """Create interactive HTML dashboard using Plotly with correct trade timeline positioning."""
         try:
             import plotly.graph_objects as go
             from plotly.subplots import make_subplots
@@ -416,28 +461,56 @@ class LogVisualizer:
         fig = make_subplots(
             rows=3, cols=1,
             subplot_titles=("Position & Trades (Large Markers)", "P&L Over Time", "Trade Execution Log"),
-            specs=[[{"secondary_y": False}], [{"secondary_y": False}], [{"type": "table"}]],
-            row_heights=[0.4, 0.4, 0.2],
-            vertical_spacing=0.12
+            specs=[[{"secondary_y": True}], [{"secondary_y": False}], [{"type": "table"}]],
+            row_heights=[0.45, 0.35, 0.2],
+            vertical_spacing=0.08
         )
         
         # Color mapping
         buy_color = 'green'
         sell_color = 'red'
         
-        # Plot data for each product
+        # Plot data for each product and include spread traces/bands
         product_colors = {'EMERALDS': 'blue', 'TOMATOES': 'orange'}
-        
+
         for product_idx, (product, snaps) in enumerate(self.snapshots.items()):
             if not snaps:
                 continue
-            
+
+            # Create timestamp mapping for this product
+            snapshots_ts = [int(s.timestamp) for s in snaps]
+            ts_to_idx = {ts: i for i, ts in enumerate(snapshots_ts)}
+
             timestamps = [str(i) for i in range(len(snaps))]
             positions = [s.position for s in snaps]
             pnls = [s.pnl for s in snaps]
-            
+
+            # Compute spreads and mids
+            spreads = []
+            mids = []
+            prices = []
+            for s in snaps:
+                bid = s.bid_wall if s.bid_wall is not None else None
+                ask = s.ask_wall if s.ask_wall is not None else None
+                mid = s.mid_price if s.mid_price is not None else None
+                if mid is None and bid is not None and ask is not None:
+                    mid = (bid + ask) / 2.0
+                mids.append(mid if mid is not None else 0)
+                if bid is not None and ask is not None:
+                    spreads.append(max(0, ask - bid))
+                else:
+                    spreads.append(0)
+                if mid is not None:
+                    prices.append(mid)
+
+            max_spread = max(spreads) if spreads else 1
+            if max_spread == 0:
+                max_spread = 1
+            max_price = max(prices) if prices else 1
+            min_price = min(prices) if prices else 0
+
             product_color = product_colors.get(product, 'blue')
-            
+
             # Add position trace
             fig.add_trace(
                 go.Scatter(
@@ -450,7 +523,7 @@ class LogVisualizer:
                 ),
                 row=1, col=1
             )
-            
+
             # Add P&L trace
             fig.add_trace(
                 go.Scatter(
@@ -463,18 +536,49 @@ class LogVisualizer:
                 ),
                 row=2, col=1
             )
-            
-            # Add trades as LARGE scatter points with detailed hover info
+
+            # Add spread as a secondary-y trace (price units)
+            if any(spreads):
+                fig.add_trace(
+                    go.Scatter(
+                        x=timestamps, y=spreads,
+                        mode='lines',
+                        name=f'{product} Spread',
+                        line=dict(color='gray', width=2, dash='dot'),
+                        hovertemplate=f'{product} Spread: %{{y}}<extra></extra>'
+                    ),
+                    row=1, col=1,
+                    secondary_y=True
+                )
+
+                # Add a light filled band around spread for emphasis
+                band_upper = [m + (s / 2.0) for m, s in zip(mids, spreads)]
+                band_lower = [m - (s / 2.0) for m, s in zip(mids, spreads)]
+                fig.add_trace(go.Scatter(x=timestamps, y=band_upper, fill=None, mode='lines', line=dict(color='lightgray', width=0), showlegend=False), row=1, col=1, secondary_y=False)
+                fig.add_trace(go.Scatter(x=timestamps, y=band_lower, fill='tonexty', mode='lines', line=dict(color='lightgray', width=0), name=f'{product} Spread Band', opacity=0.3), row=1, col=1, secondary_y=False)
+
+            # Add trades as LARGE scatter points at CORRECT timeline positions
             product_trades = [t for t in self.trades if t.product == product]
             if product_trades:
                 for i, trade in enumerate(product_trades):
+                    # Find correct position on timeline for this trade
+                    try:
+                        trade_ts = int(trade.timestamp)
+                        if trade_ts in ts_to_idx:
+                            trade_pos_idx = ts_to_idx[trade_ts]
+                        else:
+                            # Find nearest timestamp
+                            trade_pos_idx = min(range(len(snapshots_ts)), key=lambda i: abs(snapshots_ts[i] - trade_ts))
+                    except (ValueError, TypeError):
+                        trade_pos_idx = 0
+
                     marker_color = buy_color if trade.action == 'BUY' else sell_color
                     marker_symbol = 'triangle-up' if trade.action == 'BUY' else 'triangle-down'
-                    
-                    # Add large trade marker
+
+                    # Add large trade marker at CORRECT timeline position
                     fig.add_trace(
                         go.Scatter(
-                            x=[str(i)],
+                            x=[str(trade_pos_idx)],  # Use timeline position, not trade index!
                             y=[0],  # Center on 0 for visibility
                             mode='markers',
                             marker=dict(
@@ -523,16 +627,18 @@ class LogVisualizer:
             )
         
         # Update layout
-        fig.update_yaxes(title_text="Position", row=1, col=1)
+        fig.update_yaxes(title_text="Position", row=1, col=1, secondary_y=False)
+        fig.update_yaxes(title_text="Spread (price units)", row=1, col=1, secondary_y=True, showgrid=False)
         fig.update_yaxes(title_text="P&L", row=2, col=1)
         fig.update_xaxes(title_text="Time Index", row=2, col=1)
         
         fig.update_layout(
             title_text=f"Trading Strategy Dashboard ({len(self.trades)} trades)",
-            height=1000,
+            height=1600,
             hovermode='x unified',
             template='plotly_white',
-            showlegend=True
+            showlegend=True,
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
         )
         
         fig.write_html(output_file)
