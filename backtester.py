@@ -269,6 +269,7 @@ class DayResult:
     final_pnl: float
     pnl_by_product: Dict[str, float]
     activity: List[dict]
+    fills: List[Trade] = field(default_factory=list)
 
 
 def run_day(
@@ -419,6 +420,7 @@ def run_day(
         final_pnl=round(final_pnl, 2),
         pnl_by_product={k: round(v, 2) for k, v in pnl_by_product.items()},
         activity=activity,
+        fills=all_fills,
     )
     return result, position, trader_data, dict(own_trades_accum), dict(market_trades_accum)
 
@@ -505,6 +507,25 @@ def write_artifacts(backtest_id: str, results: List[DayResult], persist: bool):
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 for row in all_activity:
+                    writer.writerow(row)
+
+        # Write trades.csv (per-fill detail)
+        all_trades_rows = []
+        for r in results:
+            for f in r.fills:
+                all_trades_rows.append({
+                    "day": r.day,
+                    "timestamp": f.timestamp,
+                    "symbol": f.symbol,
+                    "price": f.price,
+                    "quantity": f.quantity,
+                    "side": "BUY" if f.quantity > 0 else "SELL",
+                })
+        if all_trades_rows:
+            with open(os.path.join(run_dir, "trades.csv"), "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["day", "timestamp", "symbol", "price", "quantity", "side"])
+                writer.writeheader()
+                for row in all_trades_rows:
                     writer.writerow(row)
 
         # Write pnl_by_product.csv
