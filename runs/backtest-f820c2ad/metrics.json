@@ -1,0 +1,25 @@
+{
+  "backtest_id": "backtest-f820c2ad",
+  "days": [
+    {
+      "day": "-1",
+      "ticks": 10000,
+      "own_trades": 222,
+      "final_pnl": 328.0,
+      "pnl_by_product": {
+        "TOMATOES": 328.0,
+        "EMERALDS": 0.0
+      }
+    },
+    {
+      "day": "-2",
+      "ticks": 10000,
+      "own_trades": 210,
+      "final_pnl": 1634.5,
+      "pnl_by_product": {
+        "TOMATOES": 1634.5,
+        "EMERALDS": 0.0
+      }
+    }
+  ]
+}

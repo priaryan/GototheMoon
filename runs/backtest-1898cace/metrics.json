@@ -1,0 +1,25 @@
+{
+  "backtest_id": "backtest-1898cace",
+  "days": [
+    {
+      "day": "-1",
+      "ticks": 10000,
+      "own_trades": 272,
+      "final_pnl": 535.0,
+      "pnl_by_product": {
+        "TOMATOES": 535.0,
+        "EMERALDS": 0.0
+      }
+    },
+    {
+      "day": "-2",
+      "ticks": 10000,
+      "own_trades": 264,
+      "final_pnl": 919.5,
+      "pnl_by_product": {
+        "TOMATOES": 919.5,
+        "EMERALDS": 0.0
+      }
+    }
+  ]
+}
