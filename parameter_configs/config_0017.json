@@ -1,0 +1,13 @@
+{
+  "id": 17,
+  "emeralds": {
+    "FAIR": 10000,
+    "INV_PENALTY": 0.02
+  },
+  "tomatoes": {
+    "EMA_ALPHA": 0.05,
+    "INV_PENALTY": 0.02,
+    "TAKE_MARGIN": 0.1,
+    "FLATTEN_THRESH": 2
+  }
+}
