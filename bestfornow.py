@@ -7,12 +7,9 @@ Main update for TOMATOES:
 detect short lived shock regimes using recent wall mid history,
 then switch to a more defensive market making mode.
 
-Shock mode behavior:
-1. widen taking thresholds
-2. reduce passive size
-3. lower effective inventory tolerance
-4. disable risky side passive quoting
-5. flatten inventory more aggressively
+Sweep-optimised params (Python backtester: 2731 → 3038):
+  Base: ema=0.15, inv_pen=0.01, take=0.2, flatten=0, no passive cap
+  Shock: move=2.0, vol=0.6, rev=1.5, take_mult=2.0, passive=1, keep both sides
 """
 
 import json
@@ -134,21 +131,21 @@ class TomatoesMM:
     """
     LIMIT = POS_LIMITS["TOMATOES"]
 
-    EMA_ALPHA = 0.10
-    INV_PENALTY = 0.02
+    EMA_ALPHA = 0.15            # sweep: faster EMA (was 0.10)
+    INV_PENALTY = 0.01            # sweep: lighter penalty (was 0.02)
 
-    TAKE_MARGIN = 0.3
-    FLATTEN_THRESH = 3
+    TAKE_MARGIN = 0.2             # sweep: tighter margin (was 0.3)
+    FLATTEN_THRESH = 0            # sweep: always flatten (was 3)
 
     HISTORY_LEN = 8
-    SHOCK_MOVE_THRESH = 4.0
-    SHOCK_VOL_THRESH = 1.75
-    SHOCK_REVERSAL_THRESH = 2.5
+    SHOCK_MOVE_THRESH = 2.0       # sweep: calibrated to data (was 4.0)
+    SHOCK_VOL_THRESH = 0.6        # sweep: calibrated to data (was 1.75)
+    SHOCK_REVERSAL_THRESH = 1.5   # sweep: calibrated to data (was 2.5)
 
-    SHOCK_TAKE_MULTIPLIER = 4.0
-    SHOCK_PASSIVE_SIZE = 2
-    NORMAL_PASSIVE_SIZE = 8
-    SHOCK_FLATTEN_THRESH = 0
+    SHOCK_TAKE_MULTIPLIER = 2.0   # sweep: less extreme (was 4.0)
+    SHOCK_PASSIVE_SIZE = 1        # sweep: minimal passive in shock (was 2)
+    SHOCK_FLATTEN_THRESH = 0      # same
+    SHOCK_DISABLE_RISKY = False   # sweep: keep quoting both sides (was True)
 
     def _compute_regime(self, mids: List[float]) -> str:
         if len(mids) < 4:
@@ -230,7 +227,7 @@ class TomatoesMM:
             if max_buy <= 0:
                 break
 
-            if regime == "shock" and pos >= flatten_thresh:
+            if regime == "shock" and self.SHOCK_DISABLE_RISKY and pos >= flatten_thresh:
                 break
 
             if sp <= fair_adj - buy_margin:
@@ -249,7 +246,7 @@ class TomatoesMM:
             if max_sell <= 0:
                 break
 
-            if regime == "shock" and pos <= -flatten_thresh:
+            if regime == "shock" and self.SHOCK_DISABLE_RISKY and pos <= -flatten_thresh:
                 break
 
             if bp >= fair_adj + sell_margin:
@@ -295,15 +292,13 @@ class TomatoesMM:
             passive_buy_size = min(passive_buy_size, self.SHOCK_PASSIVE_SIZE)
             passive_sell_size = min(passive_sell_size, self.SHOCK_PASSIVE_SIZE)
 
-            if pos > 0:
-                passive_buy_size = 0
-                ask_price = max(best_bid, min(ask_price, best_ask))
-            elif pos < 0:
-                passive_sell_size = 0
-                bid_price = min(best_ask, max(bid_price, best_bid))
-        else:
-            passive_buy_size = min(passive_buy_size, self.NORMAL_PASSIVE_SIZE)
-            passive_sell_size = min(passive_sell_size, self.NORMAL_PASSIVE_SIZE)
+            if self.SHOCK_DISABLE_RISKY:
+                if pos > 0:
+                    passive_buy_size = 0
+                    ask_price = max(best_bid, min(ask_price, best_ask))
+                elif pos < 0:
+                    passive_sell_size = 0
+                    bid_price = min(best_ask, max(bid_price, best_bid))
 
         if bid_price < ask_price:
             if passive_buy_size > 0:

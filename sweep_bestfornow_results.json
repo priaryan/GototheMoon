@@ -1,0 +1,38 @@
+{
+  "baseline_pnl": 2731.0,
+  "v6_optimal_pnl": 2902.0,
+  "best_base": {
+    "pnl": 2941.0,
+    "params": {
+      "ema_alpha": 0.15,
+      "inv_pen": 0.01,
+      "take_margin": 0.2,
+      "flatten_thresh": 0,
+      "passive_size": 0,
+      "shock_move": 99,
+      "shock_vol": 99,
+      "shock_reversal": 99,
+      "shock_take_mult": 4.0,
+      "shock_passive": 2,
+      "shock_flatten": 0,
+      "shock_disable_risky": true
+    }
+  },
+  "best_shock": {
+    "pnl": 3038.0,
+    "params": {
+      "ema_alpha": 0.15,
+      "inv_pen": 0.01,
+      "take_margin": 0.2,
+      "flatten_thresh": 0,
+      "passive_size": 0,
+      "shock_move": 2.0,
+      "shock_vol": 0.6,
+      "shock_reversal": 1.5,
+      "shock_take_mult": 2.0,
+      "shock_passive": 1,
+      "shock_flatten": 0,
+      "shock_disable_risky": false
+    }
+  }
+}
