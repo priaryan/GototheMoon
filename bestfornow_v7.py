@@ -1,17 +1,17 @@
 """
-bestfornow_v7.py — v6 + quadratic penalty, make-skew, spread-adaptive margin.
+bestfornow_v7.py — v6 + spread-adaptive TOMATOES + best-bid/ask EMERALDS.
 
 Changes from v6:
-  1. Quadratic inventory penalty: fair_adj = ema - a*pos - b*pos*|pos|
-     Steepens sharply near limits to prevent hitting ±20.
-  2. Skew making quotes: shift bid/ask by -round(pos/K) ticks
-     Uses the making side to actively flatten inventory.
-  3. Spread-adaptive take margin: widen margin when spread is large.
-  4. Cap making size on the position-increasing side near limits.
-  5. Faster EMA for taking fair value (dual EMA not needed yet — just
-     tune alpha; can split later if sweep shows benefit).
-
-EMERALDS unchanged from v6 (no edge on this data).
+  EMERALDS:
+    - Making now quotes relative to best bid/ask (not outer walls)
+      so we actually trade on the 96.8% of ticks with wide spreads.
+    - Inventory-skewed making: shift quotes to flatten position.
+    - Quadratic inventory penalty on taking fair value.
+  TOMATOES:
+    - Spread-adaptive take margin: base 0.25 + 0.2*(spread-6) when spread>6
+    - Quadratic inventory penalty for steeper position limits.
+    - Make-side skew to flatten inventory.
+    - Cap making size near position limits.
 """
 
 import json
@@ -26,10 +26,19 @@ POS_LIMITS = {
 
 
 class EmeraldsMM:
-    """EMERALDS: identical to v6."""
+    """
+    EMERALDS v7: best-bid/ask making + inventory-skew + quadratic penalty.
+
+    The book is almost always 9992/10008 (spread=16) with walls at 9990/10010.
+    v6 quoted at wall+1/wall-1 = 9991/10009 which never fills.
+    v7 quotes at best_bid+1 / best_ask-1 = 9993/10007 to be inside the spread.
+    On narrow ticks (spread=8), we tighten further and also take aggressively.
+    Inventory skew shifts quotes to flatten position.
+    """
     FAIR = 10000
     LIMIT = POS_LIMITS["EMERALDS"]
-    INV_PENALTY = 0.05
+    LINEAR_PEN = 0.05
+    QUAD_PEN = 0.002
 
     def generate_orders(self, depth: OrderDepth, position: int) -> List[Order]:
         raw_buys = depth.buy_orders or {}
@@ -40,13 +49,18 @@ class EmeraldsMM:
         buy_orders = {p: abs(v) for p, v in sorted(raw_buys.items(), reverse=True)}
         sell_orders = {p: abs(v) for p, v in sorted(raw_sells.items())}
 
-        fair = self.FAIR - self.INV_PENALTY * position
+        best_bid = max(buy_orders)
+        best_ask = min(sell_orders)
+
+        # Quadratic inventory-adjusted fair value
+        fair = self.FAIR - self.LINEAR_PEN * position - self.QUAD_PEN * position * abs(position)
 
         orders: List[Order] = []
         pos = position
         max_buy = self.LIMIT - pos
         max_sell = self.LIMIT + pos
 
+        # ── TAKE ──
         for sp, sv in sell_orders.items():
             if max_buy <= 0:
                 break
@@ -77,28 +91,25 @@ class EmeraldsMM:
                     max_sell -= size
                     pos -= size
 
-        bid_wall = min(buy_orders)
-        ask_wall = max(sell_orders)
-        bid_price = int(bid_wall + 1)
-        ask_price = int(ask_wall - 1)
+        # ── MAKE: best-bid/ask based (NEW in v7) ──
+        # Start just inside the best bid/ask
+        bid_price = best_bid + 1
+        ask_price = best_ask - 1
 
-        for bp, bv in buy_orders.items():
-            overbid = bp + 1
-            if bv > 1 and overbid < self.FAIR:
-                bid_price = max(bid_price, overbid)
-                break
-            elif bp < self.FAIR:
-                bid_price = max(bid_price, bp)
-                break
+        # Don't cross fair
+        if bid_price >= self.FAIR:
+            bid_price = self.FAIR - 1
+        if ask_price <= self.FAIR:
+            ask_price = self.FAIR + 1
 
-        for sp, sv in sell_orders.items():
-            underbid = sp - 1
-            if sv > 1 and underbid > self.FAIR:
-                ask_price = min(ask_price, underbid)
-                break
-            elif sp > self.FAIR:
-                ask_price = min(ask_price, sp)
-                break
+        # Inventory skew: shift quotes to encourage flattening
+        skew = round(pos / 8)
+        bid_price -= skew
+        ask_price -= skew
+
+        # Safety clamp: stay within fair bounds
+        bid_price = min(bid_price, self.FAIR - 1)
+        ask_price = max(ask_price, self.FAIR + 1)
 
         max_buy = self.LIMIT - pos
         max_sell = self.LIMIT + pos
@@ -125,19 +136,19 @@ class TomatoesMM:
     EMA_ALPHA = 0.1
 
     # Inventory penalty (quadratic)
-    LINEAR_PEN = 0.02       # from v6
-    QUAD_PEN = 0.003        # new: steepens near limits
+    LINEAR_PEN = 0.02
+    QUAD_PEN = 0.003
 
     # Taking
-    BASE_MARGIN = 0.25      # from v6
-    FLATTEN_THRESH = 2      # from v6
-    SPREAD_NEUTRAL = 8      # spread at which margin starts growing
-    SPREAD_SCALE = 0.1      # extra margin per tick of spread above neutral
+    BASE_MARGIN = 0.25
+    FLATTEN_THRESH = 2
+    SPREAD_NEUTRAL = 6      # sweep-optimised: margin grows when spread > 6
+    SPREAD_SCALE = 0.2      # sweep-optimised: 0.2 per tick above neutral
 
     # Making
-    SKEW_DIV = 10           # skew = round(pos / SKEW_DIV) ticks
-    MAKE_CAP_THRESH = 12    # above this |pos|, cap making on increasing side
-    MAKE_CAP_SIZE = 5       # max making size on increasing side when capped
+    SKEW_DIV = 10
+    MAKE_CAP_THRESH = 12
+    MAKE_CAP_SIZE = 5
 
     def generate_orders(self, depth: OrderDepth, position: int, ema_wm) -> tuple:
         raw_buys = depth.buy_orders or {}
