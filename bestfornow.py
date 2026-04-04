@@ -1,17 +1,3 @@
-"""
-bestfornow_v7.py
-
-EMA fair value with inventory aware taking.
-
-Main update for TOMATOES:
-detect short lived shock regimes using recent wall mid history,
-then switch to a more defensive market making mode.
-
-Sweep-optimised params (Python backtester: 2731 → 3038):
-  Base: ema=0.15, inv_pen=0.01, take=0.2, flatten=0, no passive cap
-  Shock: move=2.0, vol=0.6, rev=1.5, take_mult=2.0, passive=1, keep both sides
-"""
-
 import json
 from datamodel import Order, OrderDepth, TradingState
 from typing import Dict, List, Tuple
@@ -20,12 +6,13 @@ from typing import Dict, List, Tuple
 POS_LIMITS = {
     "EMERALDS": 20,
     "TOMATOES": 20,
+    # "PRODUCT_X": 50,  # add later when the real symbol and limit are known
 }
 
 
 class EmeraldsMM:
     """
-    EMERALDS: wall-mid making + inventory-penalised taking.
+    EMERALDS: wall mid making + inventory penalised taking.
     fair_adj = 10000 - 0.05 * position
     """
     FAIR = 10000
@@ -48,6 +35,7 @@ class EmeraldsMM:
         max_buy = self.LIMIT - pos
         max_sell = self.LIMIT + pos
 
+        # TAKE
         for sp, sv in sell_orders.items():
             if max_buy <= 0:
                 break
@@ -78,6 +66,7 @@ class EmeraldsMM:
                     max_sell -= size
                     pos -= size
 
+        # MAKE
         bid_wall = min(buy_orders)
         ask_wall = max(sell_orders)
         bid_price = int(bid_wall + 1)
@@ -114,82 +103,26 @@ class EmeraldsMM:
 
 class TomatoesMM:
     """
-    TOMATOES: EMA wall-mid making + inventory-penalised taking
-    with a shock regime detector.
-
-    Normal mode:
-    1. use EMA wall mid as fair anchor
-    2. take moderate dislocations
-    3. make around wall mid
-
-    Shock mode:
-    1. detect large recent moves / realized volatility / sharp reversals
-    2. widen take thresholds
-    3. reduce passive size
-    4. disable passive quoting on the risky side
-    5. flatten inventory earlier
+    TOMATOES: EMA wall mid making + inventory penalised taking.
+    ema_wm = 0.1 * wall_mid + 0.9 * ema_wm
+    fair_adj = ema_wm - 0.02 * position
+    take_margin = 0.25, flatten when |pos| > 2
     """
     LIMIT = POS_LIMITS["TOMATOES"]
+    EMA_ALPHA = 0.1
+    INV_PENALTY = 0.02
+    TAKE_MARGIN = 0.25
+    FLATTEN_THRESH = 2
 
-    EMA_ALPHA = 0.15            # sweep: faster EMA (was 0.10)
-    INV_PENALTY = 0.01            # sweep: lighter penalty (was 0.02)
-
-    TAKE_MARGIN = 0.2             # sweep: tighter margin (was 0.3)
-    FLATTEN_THRESH = 0            # sweep: always flatten (was 3)
-
-    HISTORY_LEN = 8
-    SHOCK_MOVE_THRESH = 2.0       # sweep: calibrated to data (was 4.0)
-    SHOCK_VOL_THRESH = 0.6        # sweep: calibrated to data (was 1.75)
-    SHOCK_REVERSAL_THRESH = 1.5   # sweep: calibrated to data (was 2.5)
-
-    SHOCK_TAKE_MULTIPLIER = 2.0   # sweep: less extreme (was 4.0)
-    SHOCK_PASSIVE_SIZE = 1        # sweep: minimal passive in shock (was 2)
-    SHOCK_FLATTEN_THRESH = 0      # same
-    SHOCK_DISABLE_RISKY = False   # sweep: keep quoting both sides (was True)
-
-    def _compute_regime(self, mids: List[float]) -> str:
-        if len(mids) < 4:
-            return "normal"
-
-        last = mids[-1]
-        prev = mids[-2]
-        short_move = last - prev
-        medium_move = last - mids[-4]
-
-        diffs = [mids[i] - mids[i - 1] for i in range(1, len(mids))]
-        realized_vol = sum(abs(x) for x in diffs[-5:]) / max(1, len(diffs[-5:]))
-
-        prev_medium = mids[-2] - mids[-5] if len(mids) >= 5 else 0.0
-        reversal = (
-            abs(short_move) >= self.SHOCK_REVERSAL_THRESH
-            and abs(prev_medium) >= self.SHOCK_REVERSAL_THRESH
-            and short_move * prev_medium < 0
-        )
-
-        large_move = abs(medium_move) >= self.SHOCK_MOVE_THRESH
-        high_vol = realized_vol >= self.SHOCK_VOL_THRESH
-
-        if reversal or (large_move and high_vol):
-            return "shock"
-        return "normal"
-
-    def generate_orders(
-        self,
-        depth: OrderDepth,
-        position: int,
-        ema_wm,
-        mid_history: List[float],
-    ) -> tuple:
+    def generate_orders(self, depth: OrderDepth, position: int, ema_wm) -> tuple:
         raw_buys = depth.buy_orders or {}
         raw_sells = depth.sell_orders or {}
         if not raw_buys or not raw_sells:
-            return [], ema_wm, mid_history, "normal"
+            return [], ema_wm
 
         buy_orders = {p: abs(v) for p, v in sorted(raw_buys.items(), reverse=True)}
         sell_orders = {p: abs(v) for p, v in sorted(raw_sells.items())}
 
-        best_bid = max(buy_orders)
-        best_ask = min(sell_orders)
         bid_wall = min(buy_orders)
         ask_wall = max(sell_orders)
         wall_mid = (bid_wall + ask_wall) / 2
@@ -199,9 +132,6 @@ class TomatoesMM:
         else:
             ema_wm = self.EMA_ALPHA * wall_mid + (1 - self.EMA_ALPHA) * ema_wm
 
-        mid_history = (mid_history + [wall_mid])[-self.HISTORY_LEN :]
-        regime = self._compute_regime(mid_history)
-
         fair_adj = ema_wm - self.INV_PENALTY * position
 
         orders: List[Order] = []
@@ -209,34 +139,25 @@ class TomatoesMM:
         max_buy = self.LIMIT - pos
         max_sell = self.LIMIT + pos
 
+        # TAKE
         buy_margin = self.TAKE_MARGIN
         sell_margin = self.TAKE_MARGIN
-        flatten_thresh = self.FLATTEN_THRESH
 
-        if regime == "shock":
-            buy_margin *= self.SHOCK_TAKE_MULTIPLIER
-            sell_margin *= self.SHOCK_TAKE_MULTIPLIER
-            flatten_thresh = self.SHOCK_FLATTEN_THRESH
-
-        if pos > flatten_thresh:
-            sell_margin = 0.0 if regime == "normal" else min(sell_margin, 0.25)
-        if pos < -flatten_thresh:
-            buy_margin = 0.0 if regime == "normal" else min(buy_margin, 0.25)
+        if pos > self.FLATTEN_THRESH:
+            sell_margin = 0.0
+        if pos < -self.FLATTEN_THRESH:
+            buy_margin = 0.0
 
         for sp, sv in sell_orders.items():
             if max_buy <= 0:
                 break
-
-            if regime == "shock" and self.SHOCK_DISABLE_RISKY and pos >= flatten_thresh:
-                break
-
             if sp <= fair_adj - buy_margin:
                 size = min(sv, max_buy)
                 orders.append(Order("TOMATOES", sp, size))
                 max_buy -= size
                 pos += size
-            elif sp <= fair_adj and pos < 0:
-                size = min(sv, abs(pos), max_buy)
+            elif sp <= fair_adj and position < 0:
+                size = min(sv, abs(position), max_buy)
                 if size > 0:
                     orders.append(Order("TOMATOES", sp, size))
                     max_buy -= size
@@ -245,22 +166,19 @@ class TomatoesMM:
         for bp, bv in buy_orders.items():
             if max_sell <= 0:
                 break
-
-            if regime == "shock" and self.SHOCK_DISABLE_RISKY and pos <= -flatten_thresh:
-                break
-
             if bp >= fair_adj + sell_margin:
                 size = min(bv, max_sell)
                 orders.append(Order("TOMATOES", bp, -size))
                 max_sell -= size
                 pos -= size
-            elif bp >= fair_adj and pos > 0:
-                size = min(bv, pos, max_sell)
+            elif bp >= fair_adj and position > 0:
+                size = min(bv, position, max_sell)
                 if size > 0:
                     orders.append(Order("TOMATOES", bp, -size))
                     max_sell -= size
                     pos -= size
 
+        # MAKE
         bid_price = int(bid_wall + 1)
         ask_price = int(ask_wall - 1)
 
@@ -285,39 +203,180 @@ class TomatoesMM:
         max_buy = self.LIMIT - pos
         max_sell = self.LIMIT + pos
 
-        passive_buy_size = max_buy
-        passive_sell_size = max_sell
+        if max_buy > 0:
+            orders.append(Order("TOMATOES", bid_price, max_buy))
+        if max_sell > 0:
+            orders.append(Order("TOMATOES", ask_price, -max_sell))
 
-        if regime == "shock":
-            passive_buy_size = min(passive_buy_size, self.SHOCK_PASSIVE_SIZE)
-            passive_sell_size = min(passive_sell_size, self.SHOCK_PASSIVE_SIZE)
+        return orders, ema_wm
 
-            if self.SHOCK_DISABLE_RISKY:
-                if pos > 0:
-                    passive_buy_size = 0
-                    ask_price = max(best_bid, min(ask_price, best_ask))
-                elif pos < 0:
-                    passive_sell_size = 0
-                    bid_price = min(best_ask, max(bid_price, best_bid))
 
-        if bid_price < ask_price:
-            if passive_buy_size > 0:
-                orders.append(Order("TOMATOES", bid_price, passive_buy_size))
-            if passive_sell_size > 0:
-                orders.append(Order("TOMATOES", ask_price, -passive_sell_size))
+class ProductXTrader:
+    """
+    PRODUCT_X: Squid Ink style extrema follower.
+
+    Idea:
+    track running low and high
+    detect characteristic trade size at an extreme
+    go long after low prints
+    go short after high prints
+    flatten when neutral
+
+    This class is intentionally directional and does not market make.
+    """
+
+    SYMBOL = "PRODUCT_X"
+    SIGNAL_QTY = 15
+    EXTREMA_EPS = 0
+    TARGET_POS = 40
+
+    def __init__(self, position_limit: int = 50):
+        self.LIMIT = position_limit
+
+    def _extract_trade_info(self, trade):
+        px = getattr(trade, "price", None)
+        qty = abs(getattr(trade, "quantity", 0))
+        ts = getattr(trade, "timestamp", None)
+        return px, qty, ts
+
+    def _update_signal(
+        self,
+        trades,
+        running_low,
+        running_high,
+        current_signal,
+        last_signal_ts,
+        wall_mid,
+    ):
+        if running_low is None:
+            running_low = wall_mid
+        if running_high is None:
+            running_high = wall_mid
+
+        low_hits = 0
+        high_hits = 0
+        newest_low_ts = None
+        newest_high_ts = None
+
+        for trade in trades:
+            px, qty, ts = self._extract_trade_info(trade)
+            if px is None:
+                continue
+
+            if running_low is None or px < running_low:
+                running_low = px
+            if running_high is None or px > running_high:
+                running_high = px
+
+            if qty != self.SIGNAL_QTY:
+                continue
+
+            if px <= running_low + self.EXTREMA_EPS:
+                low_hits += 1
+                newest_low_ts = ts
+
+            if px >= running_high - self.EXTREMA_EPS:
+                high_hits += 1
+                newest_high_ts = ts
+
+        signal = current_signal
+        signal_ts = last_signal_ts
+
+        if low_hits > 0 and high_hits == 0:
+            signal = 1
+            signal_ts = newest_low_ts
+        elif high_hits > 0 and low_hits == 0:
+            signal = -1
+            signal_ts = newest_high_ts
+        elif high_hits > 0 and low_hits > 0:
+            if newest_low_ts is not None and newest_high_ts is not None:
+                if newest_low_ts > newest_high_ts:
+                    signal = 1
+                    signal_ts = newest_low_ts
+                elif newest_high_ts > newest_low_ts:
+                    signal = -1
+                    signal_ts = newest_high_ts
+                else:
+                    signal = 0
+
+        return signal, signal_ts, running_low, running_high
+
+    def generate_orders(
+        self,
+        depth: OrderDepth,
+        position: int,
+        market_trades,
+        running_low,
+        running_high,
+        signal,
+        last_signal_ts,
+    ):
+        raw_buys = depth.buy_orders or {}
+        raw_sells = depth.sell_orders or {}
+        if not raw_buys or not raw_sells:
+            return [], running_low, running_high, signal, last_signal_ts
+
+        buy_orders = {p: abs(v) for p, v in sorted(raw_buys.items(), reverse=True)}
+        sell_orders = {p: abs(v) for p, v in sorted(raw_sells.items())}
+
+        bid_wall = min(buy_orders)
+        ask_wall = max(sell_orders)
+        wall_mid = (bid_wall + ask_wall) / 2
+
+        signal, last_signal_ts, running_low, running_high = self._update_signal(
+            market_trades,
+            running_low,
+            running_high,
+            signal,
+            last_signal_ts,
+            wall_mid,
+        )
+
+        if signal == 1:
+            target_pos = self.TARGET_POS
+        elif signal == -1:
+            target_pos = -self.TARGET_POS
         else:
-            if pos > 0 and passive_sell_size > 0:
-                orders.append(Order("TOMATOES", best_ask, -passive_sell_size))
-            elif pos < 0 and passive_buy_size > 0:
-                orders.append(Order("TOMATOES", best_bid, passive_buy_size))
+            target_pos = 0
 
-        return orders, ema_wm, mid_history, regime
+        orders: List[Order] = []
+        pos = position
+
+        # Move toward target by taking liquidity
+        if pos < target_pos:
+            need = target_pos - pos
+            max_buy = self.LIMIT - pos
+            for ap, av in sell_orders.items():
+                if need <= 0 or max_buy <= 0:
+                    break
+                size = min(av, need, max_buy)
+                if size > 0:
+                    orders.append(Order(self.SYMBOL, ap, size))
+                    pos += size
+                    need -= size
+                    max_buy -= size
+
+        elif pos > target_pos:
+            need = pos - target_pos
+            max_sell = self.LIMIT + pos
+            for bp, bv in buy_orders.items():
+                if need <= 0 or max_sell <= 0:
+                    break
+                size = min(bv, need, max_sell)
+                if size > 0:
+                    orders.append(Order(self.SYMBOL, bp, -size))
+                    pos -= size
+                    need -= size
+                    max_sell -= size
+
+        return orders, running_low, running_high, signal, last_signal_ts
 
 
 class Trader:
     def __init__(self):
         self.emeralds = EmeraldsMM()
         self.tomatoes = TomatoesMM()
+        self.product_x = ProductXTrader(position_limit=50)
 
     def run(self, state: TradingState) -> Tuple[Dict[str, List[Order]], int, str]:
         orders: Dict[str, List[Order]] = {}
@@ -330,8 +389,11 @@ class Trader:
                 pass
 
         ema_wm = td.get("ema_wm")
-        tomato_mid_history = td.get("tomato_mid_history", [])
-        tomato_regime = td.get("tomato_regime", "normal")
+
+        x_low = td.get("x_low")
+        x_high = td.get("x_high")
+        x_signal = td.get("x_signal", 0)
+        x_last_signal_ts = td.get("x_last_signal_ts")
 
         if "EMERALDS" in state.order_depths:
             pos = state.position.get("EMERALDS", 0)
@@ -341,16 +403,31 @@ class Trader:
 
         if "TOMATOES" in state.order_depths:
             pos = state.position.get("TOMATOES", 0)
-            tom_orders, ema_wm, tomato_mid_history, tomato_regime = self.tomatoes.generate_orders(
-                state.order_depths["TOMATOES"],
-                pos,
-                ema_wm,
-                tomato_mid_history,
+            tom_orders, ema_wm = self.tomatoes.generate_orders(
+                state.order_depths["TOMATOES"], pos, ema_wm
             )
             orders["TOMATOES"] = tom_orders
 
+        # PRODUCT_X intentionally not enabled yet
+        # When needed, uncomment this block and add PRODUCT_X to POS_LIMITS
+        #
+        # if "PRODUCT_X" in state.order_depths:
+        #     pos = state.position.get("PRODUCT_X", 0)
+        #     x_orders, x_low, x_high, x_signal, x_last_signal_ts = self.product_x.generate_orders(
+        #         state.order_depths["PRODUCT_X"],
+        #         pos,
+        #         state.market_trades.get("PRODUCT_X", []),
+        #         x_low,
+        #         x_high,
+        #         x_signal,
+        #         x_last_signal_ts,
+        #     )
+        #     orders["PRODUCT_X"] = x_orders
+
         td["ema_wm"] = ema_wm
-        td["tomato_mid_history"] = tomato_mid_history
-        td["tomato_regime"] = tomato_regime
+        td["x_low"] = x_low
+        td["x_high"] = x_high
+        td["x_signal"] = x_signal
+        td["x_last_signal_ts"] = x_last_signal_ts
 
         return orders, 0, json.dumps(td)
