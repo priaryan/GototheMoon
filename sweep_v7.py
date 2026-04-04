@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
-"""Fast sweep for v7 TOMATOES parameters — quadratic penalty, skew, spread-adaptive margin."""
+"""
+Sweep bestfornow_v7.py Kelp+Ink hybrid parameters for TOMATOES.
+
+Tests dual-EMA momentum signal with:
+  - MOMENTUM_WEIGHT: how much momentum tilts fair value
+  - FAST_ALPHA, SLOW_ALPHA: EMA speeds
+  - KELP_THRESH, INK_THRESH: mode thresholds
+  - INK_MARGIN_REDUCTION: Ink taking aggression
+  - TAKE_MARGIN, INV_PENALTY: base taking params
+"""
 import csv, json, os, time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -35,8 +44,7 @@ def load_and_precompute():
                     continue
                 ts = int(row["timestamp"])
                 product = row["product"]
-                buys = []
-                sells = []
+                buys, sells = [], []
                 for lvl in range(1, 4):
                     bp = row.get(f"bid_price_{lvl}", "")
                     bv = row.get(f"bid_volume_{lvl}", "")
@@ -65,23 +73,21 @@ def load_and_precompute():
 
 
 def sim_tomatoes(all_days, p):
-    """Simulate with params dict p. Returns total PnL."""
-    linear_pen = p["linear_pen"]
-    quad_pen = p["quad_pen"]
-    ema_alpha = p["ema_alpha"]
-    base_margin = p["base_margin"]
-    flatten_thresh = p["flatten_thresh"]
-    spread_neutral = p["spread_neutral"]
-    spread_scale = p["spread_scale"]
-    skew_div = p["skew_div"]
-    make_cap_thresh = p["make_cap_thresh"]
-    make_cap_size = p["make_cap_size"]
+    fast_alpha = p["fast_alpha"]
+    slow_alpha = p["slow_alpha"]
+    take_margin = p["take_margin"]
+    inv_pen = p["inv_pen"]
+    momentum_weight = p["momentum_weight"]
+    kelp_thresh = p["kelp_thresh"]
+    ink_thresh = p["ink_thresh"]
+    ink_margin_red = p["ink_margin_red"]
 
     total_pnl = 0.0
 
     for day, timestamps, ts_products in all_days:
         pos = 0
-        ema_wm = None
+        fast_ema = None
+        slow_ema = None
         cash_flow = 0.0
         last_mid = 0.0
 
@@ -91,22 +97,45 @@ def sim_tomatoes(all_days, p):
             td = ts_products[ts]["TOMATOES"]
             last_mid = td.mid_price if td.mid_price else last_mid
 
-            # EMA
-            if ema_wm is None:
-                ema_wm = td.wall_mid
+            # Update dual EMAs
+            if fast_ema is None:
+                fast_ema = td.wall_mid
+                slow_ema = td.wall_mid
             else:
-                ema_wm = ema_alpha * td.wall_mid + (1 - ema_alpha) * ema_wm
+                fast_ema = fast_alpha * td.wall_mid + (1 - fast_alpha) * fast_ema
+                slow_ema = slow_alpha * td.wall_mid + (1 - slow_alpha) * slow_ema
 
-            # Quadratic fair
-            fair_adj = ema_wm - linear_pen * pos - quad_pen * pos * abs(pos)
+            # Momentum signal
+            momentum = fast_ema - slow_ema
 
-            # Spread-adaptive margin
-            extra = max(0, (td.spread - spread_neutral)) * spread_scale
-            bm = base_margin + extra
-            sm = base_margin + extra
-            if pos > flatten_thresh:
+            # Direction + mode
+            if abs(momentum) >= ink_thresh:
+                mode = "ink"
+                direction = 1 if momentum > 0 else -1
+            elif abs(momentum) >= kelp_thresh:
+                mode = "kelp"
+                direction = 1 if momentum > 0 else -1
+            else:
+                mode = "neutral"
+                direction = 0
+
+            # Momentum-tilted fair value
+            fair_adj = slow_ema + momentum_weight * momentum - inv_pen * pos
+
+            # Taking margins
+            bm = take_margin
+            sm = take_margin
+
+            if mode == "ink":
+                if direction == 1:
+                    bm = max(0, take_margin - ink_margin_red)
+                else:
+                    sm = max(0, take_margin - ink_margin_red)
+
+            # Always flatten
+            if pos > 0:
                 sm = 0.0
-            if pos < -flatten_thresh:
+            if pos < 0:
                 bm = 0.0
 
             cur_pos = pos
@@ -117,40 +146,38 @@ def sim_tomatoes(all_days, p):
             for sp, sv in td.sell_levels:
                 if max_buy <= 0:
                     break
-                take = False
-                size = 0
                 if sp <= fair_adj - bm:
                     size = min(sv, max_buy)
-                    take = True
-                elif sp <= fair_adj and pos < 0:
-                    size = min(sv, abs(pos), max_buy)
-                    take = size > 0
-                if take and size > 0:
                     cash_flow -= sp * size
                     cur_pos += size
                     max_buy -= size
+                elif sp <= fair_adj and pos < 0:
+                    size = min(sv, abs(pos), max_buy)
+                    if size > 0:
+                        cash_flow -= sp * size
+                        cur_pos += size
+                        max_buy -= size
 
             # TAKE buys
             for bp, bv in td.buy_levels:
                 if max_sell <= 0:
                     break
-                take = False
-                size = 0
                 if bp >= fair_adj + sm:
                     size = min(bv, max_sell)
-                    take = True
-                elif bp >= fair_adj and pos > 0:
-                    size = min(bv, pos, max_sell)
-                    take = size > 0
-                if take and size > 0:
                     cash_flow += bp * size
                     cur_pos -= size
                     max_sell -= size
+                elif bp >= fair_adj and pos > 0:
+                    size = min(bv, pos, max_sell)
+                    if size > 0:
+                        cash_flow += bp * size
+                        cur_pos -= size
+                        max_sell -= size
 
-            # MAKE
+            # MAKE (standard wall-mid, match against book)
+            wm = td.wall_mid
             bid_price = td.bid_wall + 1
             ask_price = td.ask_wall - 1
-            wm = td.wall_mid
 
             for bp, bv in td.buy_levels:
                 ob = bp + 1
@@ -170,45 +197,33 @@ def sim_tomatoes(all_days, p):
                     ask_price = min(ask_price, sp)
                     break
 
-            # Skew
-            if skew_div > 0:
-                skew = round(cur_pos / skew_div)
-                bid_price -= skew
-                ask_price -= skew
-                bid_price = min(bid_price, int(wm) - 1)
-                ask_price = max(ask_price, int(wm) + 1)
+            # Kelp-style: widen adverse side
+            if abs(momentum) >= kelp_thresh:
+                if momentum > 0:
+                    if ask_price - wm < 1:
+                        ask_price = td.ask_wall
+                else:
+                    if wm - bid_price < 1:
+                        bid_price = td.bid_wall
 
             max_buy = POS_LIMIT - cur_pos
             max_sell = POS_LIMIT + cur_pos
 
-            # Cap making size
-            make_buy = max_buy
-            make_sell = max_sell
-            if make_cap_thresh > 0:
-                if cur_pos > make_cap_thresh:
-                    make_buy = min(make_buy, make_cap_size)
-                if cur_pos < -make_cap_thresh:
-                    make_sell = min(make_sell, make_cap_size)
-
             # Match make orders
-            if make_buy > 0:
-                remaining = make_buy
+            if max_buy > 0:
+                remaining = max_buy
                 for sp, sv in td.sell_levels:
-                    if remaining <= 0:
-                        break
-                    if bid_price < sp:
+                    if remaining <= 0 or bid_price < sp:
                         break
                     fill = min(remaining, sv)
                     cash_flow -= sp * fill
                     cur_pos += fill
                     remaining -= fill
 
-            if make_sell > 0:
-                remaining = make_sell
+            if max_sell > 0:
+                remaining = max_sell
                 for bp, bv in td.buy_levels:
-                    if remaining <= 0:
-                        break
-                    if ask_price > bp:
+                    if remaining <= 0 or ask_price > bp:
                         break
                     fill = min(remaining, bv)
                     cash_flow += bp * fill
@@ -229,138 +244,134 @@ def main():
     all_days = load_and_precompute()
     print(f"Loaded {len(all_days)} days in {time.time()-t0:.1f}s")
 
-    # v6 baseline params (no quad, no skew, no spread-adapt, no cap)
-    v6_params = {
-        "linear_pen": 0.02, "quad_pen": 0.0, "ema_alpha": 0.1,
-        "base_margin": 0.25, "flatten_thresh": 2,
-        "spread_neutral": 99, "spread_scale": 0.0,  # effectively off
-        "skew_div": 0, "make_cap_thresh": 0, "make_cap_size": 99,
+    # v6 baseline (single EMA, no momentum)
+    v6_baseline = {
+        "fast_alpha": 0.15, "slow_alpha": 0.15,
+        "take_margin": 0.2, "inv_pen": 0.01,
+        "momentum_weight": 0.0,
+        "kelp_thresh": 99, "ink_thresh": 99,
+        "ink_margin_red": 0.0,
     }
-    v6_pnl = sim_tomatoes(all_days, v6_params)
-    print(f"v6 baseline: {v6_pnl}")
+    v6_pnl = sim_tomatoes(all_days, v6_baseline)
+    print(f"v6 baseline (single EMA 0.15, no momentum): {v6_pnl}")
 
-    # Phase 1: Sweep each new feature independently to see impact
-    print("\n=== Feature isolation tests ===")
+    # v7 defaults
+    v7_defaults = {
+        "fast_alpha": 0.25, "slow_alpha": 0.05,
+        "take_margin": 0.2, "inv_pen": 0.01,
+        "momentum_weight": 0.3,
+        "kelp_thresh": 0.5, "ink_thresh": 1.5,
+        "ink_margin_red": 0.15,
+    }
+    v7_pnl = sim_tomatoes(all_days, v7_defaults)
+    print(f"v7 defaults (hybrid): {v7_pnl}")
 
-    # Test #1: Quadratic penalty alone
-    print("\n-- Quadratic penalty (linear_pen, quad_pen) --")
-    best_quad = (-99999, {})
-    for lp in [0.0, 0.01, 0.02, 0.03, 0.05]:
-        for qp in [0.0, 0.001, 0.002, 0.003, 0.005, 0.008, 0.01]:
-            p = dict(v6_params)
-            p["linear_pen"] = lp
-            p["quad_pen"] = qp
-            pnl = sim_tomatoes(all_days, p)
-            if pnl > best_quad[0]:
-                best_quad = (pnl, {"linear_pen": lp, "quad_pen": qp})
-            if pnl > v6_pnl:
-                print(f"  lp={lp:.3f} qp={qp:.3f} -> {pnl:>8.2f}  (+{pnl-v6_pnl:.2f})")
-    print(f"  BEST quad: {best_quad}")
+    print()
 
-    # Test #2: Skew alone
-    print("\n-- Make skew (skew_div) --")
-    best_skew = (-99999, {})
-    for sd in [0, 5, 7, 8, 10, 12, 15, 20]:
-        p = dict(v6_params)
-        p["skew_div"] = sd
-        pnl = sim_tomatoes(all_days, p)
-        tag = " ***" if pnl > v6_pnl else ""
-        print(f"  skew_div={sd:>3} -> {pnl:>8.2f}{tag}")
-        if pnl > best_skew[0]:
-            best_skew = (pnl, {"skew_div": sd})
-    print(f"  BEST skew: {best_skew}")
+    # ═══════════════════════════════════════════
+    # PHASE 1: Sweep dual EMA + momentum weight
+    # ═══════════════════════════════════════════
+    print("=" * 60)
+    print("PHASE 1: EMA speeds + momentum weight (no modes)")
+    print("=" * 60)
 
-    # Test #3: Spread-adaptive margin alone
-    print("\n-- Spread-adaptive margin (spread_neutral, spread_scale) --")
-    best_spread = (-99999, {})
-    for sn in [4, 6, 8, 10, 12]:
-        for ss in [0.0, 0.05, 0.1, 0.15, 0.2, 0.3]:
-            p = dict(v6_params)
-            p["spread_neutral"] = sn
-            p["spread_scale"] = ss
-            pnl = sim_tomatoes(all_days, p)
-            if pnl > best_spread[0]:
-                best_spread = (pnl, {"spread_neutral": sn, "spread_scale": ss})
-    print(f"  BEST spread-adapt: {best_spread}")
-
-    # Test #4: Make cap alone
-    print("\n-- Make cap (make_cap_thresh, make_cap_size) --")
-    best_cap = (-99999, {})
-    for mct in [0, 8, 10, 12, 15]:
-        for mcs in [3, 5, 8, 99]:
-            p = dict(v6_params)
-            p["make_cap_thresh"] = mct
-            p["make_cap_size"] = mcs
-            pnl = sim_tomatoes(all_days, p)
-            if pnl > best_cap[0]:
-                best_cap = (pnl, {"make_cap_thresh": mct, "make_cap_size": mcs})
-    print(f"  BEST cap: {best_cap}")
-
-    # Phase 2: Combine the best of each
-    print("\n=== Phase 2: Combined sweep ===")
-    # Take best values from isolation and vary around them
-    quad_lps = [best_quad[1]["linear_pen"] + d for d in [-0.01, 0, 0.01]]
-    quad_qps = [best_quad[1]["quad_pen"] + d for d in [-0.001, 0, 0.001, 0.002]]
-    quad_lps = [max(0, x) for x in quad_lps]
-    quad_qps = [max(0, x) for x in quad_qps]
-    skew_divs = [0, best_skew[1]["skew_div"]]
-    if best_skew[1]["skew_div"] > 0:
-        skew_divs += [best_skew[1]["skew_div"] - 2, best_skew[1]["skew_div"] + 2]
-    skew_divs = sorted(set(max(0, x) for x in skew_divs))
-    spread_sns = [best_spread[1]["spread_neutral"]]
-    spread_sss = [0.0, best_spread[1]["spread_scale"]]
-    cap_mcts = [0, best_cap[1]["make_cap_thresh"]]
-    cap_mcss = [best_cap[1]["make_cap_size"]]
-    ema_alphas = [0.05, 0.1, 0.15, 0.2]
-    base_margins = [0.0, 0.15, 0.25, 0.35, 0.5]
-    flatten_threshs = [1, 2, 3, 5]
-
-    total = (len(quad_lps) * len(quad_qps) * len(skew_divs) * len(spread_sss) *
-             len(cap_mcts) * len(ema_alphas) * len(base_margins) * len(flatten_threshs))
-    print(f"Combinations: {total}")
-
-    results = []
+    best_p1 = (v6_pnl, v6_baseline)
     count = 0
-    for lp in quad_lps:
-        for qp in quad_qps:
-            for sd in skew_divs:
-                for ss in spread_sss:
-                    for mct in cap_mcts:
-                        for ea in ema_alphas:
-                            for bm in base_margins:
-                                for ft in flatten_threshs:
-                                    p = {
-                                        "linear_pen": lp, "quad_pen": qp,
-                                        "ema_alpha": ea, "base_margin": bm,
-                                        "flatten_thresh": ft,
-                                        "spread_neutral": spread_sns[0],
-                                        "spread_scale": ss,
-                                        "skew_div": sd,
-                                        "make_cap_thresh": mct,
-                                        "make_cap_size": cap_mcss[0],
-                                    }
-                                    pnl = sim_tomatoes(all_days, p)
-                                    results.append((pnl, dict(p)))
-                                    count += 1
-                                    if count % 2000 == 0:
-                                        print(f"  {count}/{total}...")
+    for fa in [0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]:
+        for sa in [0.02, 0.03, 0.05, 0.08, 0.10, 0.15]:
+            if sa > fa:
+                continue
+            for mw in [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]:
+                for tm in [0.0, 0.10, 0.15, 0.20, 0.25]:
+                    for ip in [0.0, 0.01, 0.02, 0.03]:
+                        p = dict(v6_baseline,
+                                 fast_alpha=fa, slow_alpha=sa,
+                                 momentum_weight=mw,
+                                 take_margin=tm, inv_pen=ip,
+                                 kelp_thresh=99, ink_thresh=99)
+                        pnl = sim_tomatoes(all_days, p)
+                        count += 1
+                        if pnl > best_p1[0]:
+                            best_p1 = (pnl, dict(p))
+                            print(f"  NEW: {pnl:>8.2f}  fa={fa} sa={sa} mw={mw} tm={tm} ip={ip}")
 
-    results.sort(key=lambda x: -x[0])
-    print(f"\nTop 20 combined:")
-    print(f"{'Rank':>4} {'PnL':>10} {'lp':>6} {'qp':>6} {'ema':>5} {'margin':>7} {'flat':>5} {'skew':>5} {'sprS':>5} {'capT':>5}")
-    for i, (pnl, p) in enumerate(results[:20]):
-        print(f"{i+1:>4} {pnl:>10.2f} {p['linear_pen']:>6.3f} {p['quad_pen']:>6.4f} {p['ema_alpha']:>5.2f} {p['base_margin']:>7.2f} {p['flatten_thresh']:>5} {p['skew_div']:>5} {p['spread_scale']:>5.2f} {p['make_cap_thresh']:>5}")
+    print(f"\nPhase 1: {count} combos in {time.time()-t0:.0f}s")
+    print(f"Best: {best_p1[0]}")
+    for k, v in best_p1[1].items():
+        if k not in ("kelp_thresh", "ink_thresh", "ink_margin_red"):
+            print(f"  {k}: {v}")
 
-    best_pnl, best_p = results[0]
+    # ═══════════════════════════════════════════
+    # PHASE 2: Kelp + Ink mode thresholds
+    # ═══════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("PHASE 2: Kelp + Ink mode thresholds (on top of best P1)")
+    print("=" * 60)
+
+    base_p = dict(best_p1[1])
+    base_pnl = best_p1[0]
+    best_p2 = (base_pnl, base_p)
+    count2 = 0
+
+    for kt in [0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 99]:
+        for it in [0.5, 0.7, 1.0, 1.5, 2.0, 99]:
+            if it <= kt and it != 99:
+                continue
+            for imr in [0.0, 0.05, 0.10, 0.15, 0.20]:
+                p = dict(base_p,
+                         kelp_thresh=kt, ink_thresh=it,
+                         ink_margin_red=imr)
+                pnl = sim_tomatoes(all_days, p)
+                count2 += 1
+                if pnl > best_p2[0]:
+                    best_p2 = (pnl, dict(p))
+                    print(f"  NEW: {pnl:>8.2f}  kt={kt} it={it} imr={imr}")
+
+    print(f"\nPhase 2: {count2} combos in {time.time()-t0:.0f}s")
+    print(f"Best with modes: {best_p2[0]} (delta={best_p2[0]-base_pnl:+.2f})")
+    for k, v in best_p2[1].items():
+        print(f"  {k}: {v}")
+
+    # ═══════════════════════════════════════════
+    # PHASE 3: Quick check alternative strategies
+    # ═══════════════════════════════════════════
+    print("\n" + "=" * 60)
+    print("PHASE 3: Strategy variants")
+    print("=" * 60)
+
+    optimal = best_p2[1]
+
+    # 3a: Momentum weight sensitivity
+    print("\n-- Momentum weight sensitivity --")
+    for mw in [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0]:
+        p = dict(optimal, momentum_weight=mw)
+        pnl = sim_tomatoes(all_days, p)
+        delta = pnl - best_p2[0]
+        tag = " ***" if pnl > best_p2[0] else ""
+        print(f"  mw={mw:.1f}: {pnl:>8.2f} ({delta:+.2f}){tag}")
+
+    # 3b: Single EMA reference (like v6)
+    print("\n-- Single EMA reference (like v6) --")
+    for alpha in [0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25]:
+        p = dict(optimal, fast_alpha=alpha, slow_alpha=alpha, momentum_weight=0.0,
+                 kelp_thresh=99, ink_thresh=99)
+        pnl = sim_tomatoes(all_days, p)
+        delta = pnl - best_p2[0]
+        print(f"  ema={alpha:.2f}: {pnl:>8.2f} ({delta:+.2f})")
+
+    elapsed = time.time() - t0
     print(f"\n{'='*60}")
-    print(f"BEST: PnL={best_pnl} (v6 was {v6_pnl}, delta={best_pnl-v6_pnl:+.2f})")
-    print(f"Params: {json.dumps(best_p, indent=2)}")
-    print(f"Elapsed: {time.time()-t0:.1f}s")
+    print(f"Total: {elapsed:.0f}s")
 
-    with open(os.path.join(ROOT, "sweep_v7_results.json"), "w") as f:
-        json.dump({"best_pnl": best_pnl, "best_params": best_p, "v6_pnl": v6_pnl,
-                    "top_20": [(pnl, p) for pnl, p in results[:20]]}, f, indent=2)
-    print("Saved to sweep_v7_results.json")
+    summary = {
+        "v6_pnl": v6_pnl,
+        "v7_default_pnl": v7_pnl,
+        "best_ema_momentum": {"pnl": best_p1[0], "params": best_p1[1]},
+        "best_with_modes": {"pnl": best_p2[0], "params": best_p2[1]},
+    }
+    with open("sweep_v7_results.json", "w") as f:
+        json.dump(summary, f, indent=2)
+    print("Results saved to sweep_v7_results.json")
 
 
 if __name__ == "__main__":
