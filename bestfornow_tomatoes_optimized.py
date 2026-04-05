@@ -1,10 +1,11 @@
 import json
+import json
 from datamodel import Order, OrderDepth, TradingState
 from typing import Dict, List, Tuple
 
 
-# Position limits per product
 POS_LIMITS = {
+    "EMERALDS": 20,
     "EMERALDS": 20,
     "TOMATOES": 20,
 }
@@ -120,7 +121,6 @@ class MeanRevertingMarketMaker:
         buy_orders = {p: abs(v) for p, v in sorted(raw_buys.items(), reverse=True)}
         sell_orders = {p: abs(v) for p, v in sorted(raw_sells.items())}
 
-        # Wall prices (outermost levels) and their midpoint
         bid_wall = min(buy_orders)
         ask_wall = max(sell_orders)
         wall_mid = (bid_wall + ask_wall) / 2
@@ -150,6 +150,7 @@ class MeanRevertingMarketMaker:
             if sp <= fair:
                 size = min(sv, max_buy)
                 orders.append(Order("TOMATOES", sp, size))
+                orders.append(Order("TOMATOES", sp, size))
                 max_buy -= size
                 pos += size
             elif sp <= fair and position < 0:
@@ -165,6 +166,7 @@ class MeanRevertingMarketMaker:
                 break
             if bp >= fair:
                 size = min(bv, max_sell)
+                orders.append(Order("TOMATOES", bp, -size))
                 orders.append(Order("TOMATOES", bp, -size))
                 max_sell -= size
                 pos -= size
