@@ -112,16 +112,16 @@ class EmeraldsMM:
 
 class TomatoesMM:
     """
-    TOMATOES: Kelp + Ink hybrid using dual EMA momentum.
+    TOMATOES: Dual EMA momentum with regime-aware inventory management.
 
-    fair_adj = slow_ema + MOMENTUM_WEIGHT * (fast_ema - slow_ema)
+    fair_adj = slow_ema + MOMENTUM_WEIGHT * scaled_momentum - inv_pen * position
 
-    Regime filter: zero out momentum below MOMENTUM_THRESHOLD to avoid
-    whipsawing during sideways/choppy periods.
+    Soft dampening: scales momentum linearly below MOMENTUM_THRESHOLD
+      instead of a binary cutoff, avoiding signal discontinuities.
+    Adaptive IP: uses higher inventory penalty (INV_PENALTY_HIGH) in
+      low-momentum regimes where chop risk dominates.
 
-    Warmup:
-      - update EMA state only
-      - place no orders for the first WARMUP_TICKS observations
+    Warmup: update EMA state only, no orders for first WARMUP_TICKS ticks.
     """
     LIMIT = POS_LIMITS["TOMATOES"]
 
@@ -131,8 +131,9 @@ class TomatoesMM:
     MOMENTUM_WEIGHT = 0.5
 
     TAKE_MARGIN = 0.0
-    INV_PENALTY = 0.02
-    MOMENTUM_THRESHOLD = 0.60
+    INV_PENALTY = 0.02       # used when momentum is strong (trending)
+    INV_PENALTY_HIGH = 0.08  # used when momentum is weak (choppy)
+    MOMENTUM_THRESHOLD = 0.75
 
     WARMUP_TICKS = 5
 
@@ -170,14 +171,23 @@ class TomatoesMM:
         if warmup_ticks <= self.WARMUP_TICKS:
             return [], fast_ema, slow_ema, warmup_ticks
 
-        momentum = fast_ema - slow_ema
-        if abs(momentum) < self.MOMENTUM_THRESHOLD:
-            momentum = 0.0
+        raw_momentum = fast_ema - slow_ema
+        abs_mom = abs(raw_momentum)
+
+        # Soft dampening: linear ramp from 0 to full at threshold
+        scale = min(1.0, abs_mom / self.MOMENTUM_THRESHOLD)
+        momentum = raw_momentum * scale
+
+        # Adaptive inventory penalty: stronger in low-momentum (choppy) regime
+        if abs_mom < self.MOMENTUM_THRESHOLD:
+            inv_pen = self.INV_PENALTY_HIGH
+        else:
+            inv_pen = self.INV_PENALTY
 
         fair_adj = (
             slow_ema
             + self.MOMENTUM_WEIGHT * momentum
-            - self.INV_PENALTY * position
+            - inv_pen * position
         )
 
         orders: List[Order] = []
