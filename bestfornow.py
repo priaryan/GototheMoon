@@ -28,7 +28,7 @@ class EmeraldsMM:
     """
     FAIR = 10000
     LIMIT = POS_LIMITS["EMERALDS"]
-    INV_PENALTY = 0.05
+    INV_PENALTY = 0.0
 
     def generate_orders(self, depth: OrderDepth, position: int) -> List[Order]:
         raw_buys = depth.buy_orders or {}
@@ -116,6 +116,9 @@ class TomatoesMM:
 
     fair_adj = slow_ema + MOMENTUM_WEIGHT * (fast_ema - slow_ema)
 
+    Regime filter: zero out momentum below MOMENTUM_THRESHOLD to avoid
+    whipsawing during sideways/choppy periods.
+
     Warmup:
       - update EMA state only
       - place no orders for the first WARMUP_TICKS observations
@@ -128,7 +131,8 @@ class TomatoesMM:
     MOMENTUM_WEIGHT = 0.5
 
     TAKE_MARGIN = 0.0
-    INV_PENALTY = 0.0
+    INV_PENALTY = 0.02
+    MOMENTUM_THRESHOLD = 0.60
 
     WARMUP_TICKS = 5
 
@@ -167,6 +171,8 @@ class TomatoesMM:
             return [], fast_ema, slow_ema, warmup_ticks
 
         momentum = fast_ema - slow_ema
+        if abs(momentum) < self.MOMENTUM_THRESHOLD:
+            momentum = 0.0
 
         fair_adj = (
             slow_ema
