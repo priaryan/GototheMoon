@@ -114,14 +114,9 @@ class TomatoesMM:
     """
     TOMATOES: Dual EMA momentum with regime-aware inventory management.
 
-    fair_adj = slow_ema + MOMENTUM_WEIGHT * scaled_momentum - inv_pen * position
-
-    Soft dampening: scales momentum linearly below MOMENTUM_THRESHOLD
-      instead of a binary cutoff, avoiding signal discontinuities.
-    Adaptive IP: uses higher inventory penalty (INV_PENALTY_HIGH) in
-      low-momentum regimes where chop risk dominates.
-
-    Warmup: update EMA state only, no orders for first WARMUP_TICKS ticks.
+    Soft dampening: scales momentum linearly below MOMENTUM_THRESHOLD.
+    Adaptive IP: higher inventory penalty in low-momentum regimes.
+    Warmup: update state only, no orders for first WARMUP_TICKS ticks.
     """
     LIMIT = POS_LIMITS["TOMATOES"]
 
@@ -131,8 +126,8 @@ class TomatoesMM:
     MOMENTUM_WEIGHT = 0.5
 
     TAKE_MARGIN = 0.0
-    INV_PENALTY = 0.02       # used when momentum is strong (trending)
-    INV_PENALTY_HIGH = 0.08  # used when momentum is weak (choppy)
+    INV_PENALTY = 0.02
+    INV_PENALTY_HIGH = 0.08
     MOMENTUM_THRESHOLD = 0.75
 
     WARMUP_TICKS = 5
@@ -159,6 +154,7 @@ class TomatoesMM:
         ask_wall = max(sell_orders)
         wall_mid = (bid_wall + ask_wall) / 2
 
+        # ── EMA updates ──
         if fast_ema is None:
             fast_ema = wall_mid
             slow_ema = wall_mid
@@ -167,18 +163,16 @@ class TomatoesMM:
             slow_ema = self.SLOW_ALPHA * wall_mid + (1 - self.SLOW_ALPHA) * slow_ema
 
         warmup_ticks += 1
-
         if warmup_ticks <= self.WARMUP_TICKS:
             return [], fast_ema, slow_ema, warmup_ticks
 
+        # ── Momentum with soft dampening ──
         raw_momentum = fast_ema - slow_ema
         abs_mom = abs(raw_momentum)
-
-        # Soft dampening: linear ramp from 0 to full at threshold
         scale = min(1.0, abs_mom / self.MOMENTUM_THRESHOLD)
         momentum = raw_momentum * scale
 
-        # Adaptive inventory penalty: stronger in low-momentum (choppy) regime
+        # Adaptive inventory penalty
         if abs_mom < self.MOMENTUM_THRESHOLD:
             inv_pen = self.INV_PENALTY_HIGH
         else:
@@ -197,7 +191,6 @@ class TomatoesMM:
 
         buy_margin = self.TAKE_MARGIN
         sell_margin = self.TAKE_MARGIN
-
         if pos > 0:
             sell_margin = 0.0
         if pos < 0:
@@ -233,6 +226,7 @@ class TomatoesMM:
                     max_sell -= size
                     pos -= size
 
+        # ── Passive quoting ──
         bid_price = int(bid_wall + 1)
         ask_price = int(ask_wall - 1)
 
