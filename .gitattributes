@@ -1,0 +1,5 @@
+# Generated visualisation output — don't count toward language stats
+*.html linguist-documentation
+runs/** linguist-generated
+backtests/** linguist-generated
+scratch/** linguist-vendored

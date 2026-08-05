@@ -44,3 +44,7 @@ wheels/
 
 # External repositories
 backtests/imc-prosperity-3-backtester/
+
+# Generated dashboards and plots (regenerate with log_visualizer.py)
+trading_dashboard.html
+runs/**/plot_*.html
